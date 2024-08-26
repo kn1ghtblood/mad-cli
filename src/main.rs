@@ -1,6 +1,7 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::{
+    collections::HashSet,
     env,
     fs::{self, File, OpenOptions},
     io::{self, Error, Read, Write},
@@ -15,79 +16,6 @@ use ureq;
 const SAVE_PATH: &str = "downloads";
 const VIDEO_M3U8_PREFIX: &str = "https://surrit.com/";
 const VIDEO_PLAYLIST_SUFFIX: &str = "/playlist.m3u8";
-
-async fn get_uuid(url: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let res = ureq::get(&url).call()?.into_string()?;
-    // println!("response: {}", res);
-    let re = Regex::new(r"https:\\/\\/sixyik\.com\\/([^\\/]+)\\/seek\\/_0\.jpg")?;
-    if let Some(captures) = re.captures(&res) {
-        // Extract and return the UUID
-        let uuid = captures.get(1).map_or("", |m| m.as_str());
-        println!("Matching uuid successfully: {}", uuid);
-        Ok(uuid.to_string())
-    } else {
-        eprintln!("Failed to match uuid.");
-        Err("Failed to match uuid.".into())
-    }
-}
-
-fn make_folders(name: &str) {
-    let path = format!("{}/{}", &SAVE_PATH, name);
-    if !Path::new(&path).exists() {
-        match fs::create_dir_all(&path) {
-            Ok(_) => println!("Created directory: {}", path),
-            Err(e) => eprintln!("Failed to create directory: {}", e),
-        }
-    } else {
-        println!("Directory already exists: {}", path);
-    }
-}
-
-fn get_num() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-}
-
-fn split_integer_into_intervals(integer: i32, n: usize) -> Vec<(i32, i32)> {
-    let interval_size = integer / n as i32;
-    let remainder = integer % n as i32;
-
-    let mut intervals: Vec<(i32, i32)> = (0..n)
-        .map(|i| (i as i32 * interval_size, (i as i32 + 1) * interval_size))
-        .collect();
-
-    if let Some(last) = intervals.last_mut() {
-        last.1 += remainder;
-    }
-    intervals
-}
-
-fn request_with_retry(url: &str) -> Option<Vec<u8>> {
-    let max_retries = 5;
-    let delay = 2;
-    let mut retries = 0;
-    while retries < max_retries {
-        match ureq::get(url).call() {
-            Ok(res) => {
-                if res.status() == 200 {
-                    // return Some(res.into_reader().bytes().collect::<Result<Vec<_>, _>>());
-                    let mut reader = res.into_reader();
-                    let mut bytes = Vec::new();
-                    match reader.read_to_end(&mut bytes) {
-                        Ok(_) => return Some(bytes),
-                        Err(e) => println!("Failed to read response into bytes: {}", e),
-                    }
-                }
-            }
-            Err(_) => {
-                retries += 1;
-                sleep(Duration::from_secs(delay));
-            }
-        }
-    }
-    None
-}
 
 struct ThreadSafeCounter {
     count: Mutex<i32>,
@@ -117,6 +45,12 @@ impl ThreadSafeCounter {
     }
 }
 static COUNTER: Lazy<Arc<ThreadSafeCounter>> = Lazy::new(|| Arc::new(ThreadSafeCounter::new()));
+
+fn get_num() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
 
 fn display_progress_bar(max_value: i32) {
     let bar_length = 50;
@@ -162,46 +96,6 @@ fn thread_task(
             println!("failed");
         }
     }
-}
-
-fn download_jpegs_frames(
-    intervals: Vec<(i32, i32)>,
-    uuid: String,
-    resolution: String,
-    movie_name: String,
-    video_offset_max: i32,
-) -> Result<(), String> {
-    let mut thread_task_list = vec![];
-
-    for interval in intervals {
-        let uuid_clone = uuid.clone();
-        let resolution_clone = resolution.clone();
-        let movie_name_clone = movie_name.clone();
-        let start = interval.0;
-        let end = interval.1;
-        let video_offset_max_clone = video_offset_max;
-
-        let thread = thread::spawn(move || {
-            thread_task(
-                start,
-                end,
-                uuid_clone,
-                resolution_clone,
-                movie_name_clone,
-                video_offset_max_clone,
-            );
-        });
-
-        thread_task_list.push(thread);
-    }
-
-    for thread in thread_task_list {
-        if let Err(e) = thread.join() {
-            eprintln!("Thread failed: {:?}", e);
-            return Err(format!("Thread faile: {:?}", e));
-        }
-    }
-    Ok(())
 }
 
 fn frames_to_video(name: &str, total_frames: i32) {
@@ -258,17 +152,19 @@ fn frames_to_video(name: &str, total_frames: i32) {
 fn gen_list_txt(name: &str, total_frames: i32) -> io::Result<()> {
     let out_file_name = format!("{}/{}.mp4", SAVE_PATH, name);
     let mut count = 0;
-    let list_file = "list.txt";
+    let list_file = format!("{}/{}/list.txt", SAVE_PATH, name);
     let mut list_txt = File::create(list_file)?;
 
     for i in 0..=total_frames {
         let file_path = format!("{}/{}/video{}.jpeg", SAVE_PATH, name, i);
+        let file_name = format!("video{}.jpeg", i);
         if Path::new(&file_path).exists() {
             count += 1;
-            writeln!(list_txt, "file '{}'", file_path);
+            writeln!(list_txt, "file '{}'", file_name);
+        } else {
+            println!("[X]Error locating the frames");
         }
     }
-    println!();
     println!("Complete save jpegs for: {}", out_file_name);
     println!(
         "Total files count: {}, found files count: {}",
@@ -285,24 +181,34 @@ fn gen_list_txt(name: &str, total_frames: i32) -> io::Result<()> {
 fn frames_to_video_ffmpeg(name: &str, total_frames: i32) -> io::Result<()> {
     match gen_list_txt(name, total_frames) {
         Ok(()) => {
+            let list_location = format!("{}/{}/list.txt", SAVE_PATH, name);
             let out_file_name = format!("{}/{}.mp4", SAVE_PATH, name);
+            //TODO: Use portable FFmpeg binary
+            let ffmpeg_path = if cfg!(target_os = "windows") {
+                Path::new("bin/ffmpeg.exe")
+            } else if cfg!(target_os = "linux") {
+                Path::new("bin/ffmpeg")
+            } else {
+                return Err(Error::new(
+                    std::io::ErrorKind::Other,
+                    "Unsupported operating system",
+                ));
+            };
             let ffmpeg_command = [
-                "ffmpeg",
+                // "ffmpeg",
                 "-f",
                 "concat",
                 "-safe",
                 "0",
                 "-i",
-                "list.txt",
+                &list_location,
                 "-c",
                 "copy",
                 &out_file_name,
             ];
-            let status = Command::new(&ffmpeg_command[0])
-                .args(&ffmpeg_command[1..])
+            let status = Command::new(ffmpeg_path)
+                .args(&ffmpeg_command)
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
                 .status()?;
 
             if status.success() {
@@ -323,6 +229,158 @@ fn frames_to_video_ffmpeg(name: &str, total_frames: i32) -> io::Result<()> {
             eprintln!("Failed to genearate list: {}", e);
             Err(e)
         }
+    }
+}
+
+fn get_movie_url_by_code(key: &str) -> Option<String> {
+    let search_url = format!("https://missav.com/search/{}", key);
+    let search_regex = format!(r#"<a href="([^"]+)" alt="{}">"#, key);
+
+    let response = ureq::get(&search_url)
+        .call()
+        .expect("Failed to fetch the search URL");
+    let html_source = response
+        .into_string()
+        .expect("Failed to read response body");
+
+    let re = Regex::new(&search_regex).expect("Failed to compile regex");
+    let movie_url_matches: Vec<String> = re
+        .captures_iter(&html_source)
+        .map(|cap| cap[1].to_string())
+        .collect();
+
+    let temp_url_list: HashSet<String> = movie_url_matches.into_iter().collect();
+
+    if !temp_url_list.is_empty() {
+        Some(temp_url_list.into_iter().next().unwrap())
+    } else {
+        None
+    }
+}
+
+fn make_folders(name: &str) {
+    let path = format!("{}/{}", &SAVE_PATH, name);
+    if !Path::new(&path).exists() {
+        match fs::create_dir_all(&path) {
+            Ok(_) => println!("Created directory: {}", path),
+            Err(e) => eprintln!("Failed to create directory: {}", e),
+        }
+    } else {
+        println!("Directory already exists: {}", path);
+    }
+}
+
+async fn delete_all_subfolders(folder_path: &str) -> std::io::Result<()> {
+    let path = Path::new(folder_path);
+
+    if !path.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let item_path = entry.path();
+
+        if item_path.is_dir() {
+            fs::remove_dir_all(item_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn split_integer_into_intervals(integer: i32, n: usize) -> Vec<(i32, i32)> {
+    let interval_size = integer / n as i32;
+    let remainder = integer % n as i32;
+
+    let mut intervals: Vec<(i32, i32)> = (0..n)
+        .map(|i| (i as i32 * interval_size, (i as i32 + 1) * interval_size))
+        .collect();
+
+    if let Some(last) = intervals.last_mut() {
+        last.1 += remainder;
+    }
+    intervals
+}
+
+fn request_with_retry(url: &str) -> Option<Vec<u8>> {
+    let max_retries = 5;
+    let delay = 2;
+    let mut retries = 0;
+    while retries < max_retries {
+        match ureq::get(url).call() {
+            Ok(res) => {
+                if res.status() == 200 {
+                    // return Some(res.into_reader().bytes().collect::<Result<Vec<_>, _>>());
+                    let mut reader = res.into_reader();
+                    let mut bytes = Vec::new();
+                    match reader.read_to_end(&mut bytes) {
+                        Ok(_) => return Some(bytes),
+                        Err(e) => println!("Failed to read response into bytes: {}", e),
+                    }
+                }
+            }
+            Err(_) => {
+                retries += 1;
+                sleep(Duration::from_secs(delay));
+            }
+        }
+    }
+    None
+}
+
+fn download_jpegs_frames(
+    intervals: Vec<(i32, i32)>,
+    uuid: String,
+    resolution: String,
+    movie_name: String,
+    video_offset_max: i32,
+) -> Result<(), String> {
+    let mut thread_task_list = vec![];
+
+    for interval in intervals {
+        let uuid_clone = uuid.clone();
+        let resolution_clone = resolution.clone();
+        let movie_name_clone = movie_name.clone();
+        let start = interval.0;
+        let end = interval.1;
+        let video_offset_max_clone = video_offset_max;
+
+        let thread = thread::spawn(move || {
+            thread_task(
+                start,
+                end,
+                uuid_clone,
+                resolution_clone,
+                movie_name_clone,
+                video_offset_max_clone,
+            );
+        });
+
+        thread_task_list.push(thread);
+    }
+
+    for thread in thread_task_list {
+        if let Err(e) = thread.join() {
+            eprintln!("Thread failed: {:?}", e);
+            return Err(format!("Thread faile: {:?}", e));
+        }
+    }
+    Ok(())
+}
+
+async fn get_uuid(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let res = ureq::get(&url).call()?.into_string()?;
+    // println!("response: {}", res);
+    let re = Regex::new(r"https:\\/\\/sixyik\.com\\/([^\\/]+)\\/seek\\/_0\.jpg")?;
+    if let Some(captures) = re.captures(&res) {
+        // Extract and return the UUID
+        let uuid = captures.get(1).map_or("", |m| m.as_str());
+        println!("Matching uuid successfully: {}", uuid);
+        Ok(uuid.to_string())
+    } else {
+        eprintln!("Failed to match uuid.");
+        Err("Failed to match uuid.".into())
     }
 }
 
@@ -373,8 +431,16 @@ async fn download(url: &str) {
                                                     )
                                                     .is_ok()
                                                     {
-                                                        // frames_to_video(movie_name, digit);
-                                                        frames_to_video_ffmpeg(movie_name, digit);
+                                                        let file_path = format!(
+                                                            "{}/{}.mp4",
+                                                            SAVE_PATH, movie_name
+                                                        );
+                                                        if !Path::new(&file_path).exists() {
+                                                            // frames_to_video(movie_name, digit);
+                                                            frames_to_video_ffmpeg(
+                                                                movie_name, digit,
+                                                            );
+                                                        }
                                                     }
                                                     COUNTER.reset();
                                                 }
@@ -404,18 +470,24 @@ async fn download(url: &str) {
     }
 }
 
-fn init_download(urls: Vec<String>, jcode: Option<String>) {
+async fn init_download(urls: Vec<String>, jcode: Option<String>) {
     if !urls.is_empty() {
         println!("URLs provided: {:?}", urls);
         for url in urls {
             println!("[+]Processing URL: {}", url.clone());
-            //delete_sub_folders
-            download(&url);
-            //delete_sub_folders
+            delete_all_subfolders(SAVE_PATH).await;
+            download(&url).await;
+            // delete_all_subfolders(SAVE_PATH).await;
             println!("[+]Processing URL Complete: {}", url);
         }
     } else if let Some(s) = jcode {
         println!("Code provided: {}", s);
+        match get_movie_url_by_code(&s) {
+            Some(url) => {
+                download(&url).await;
+            }
+            None => println!("Video URL not found for code: {}", s),
+        }
     } else {
         println!("No valid argument provided.");
     }
@@ -451,8 +523,8 @@ async fn main() {
         }
     }
 
-    // init_download(urls, jcode);
+    init_download(urls, jcode).await;
 
-    let url = "";
-    download(url).await;
+    // let url = "";
+    // download(url).await;
 }
