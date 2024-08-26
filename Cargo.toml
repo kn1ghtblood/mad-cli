@@ -1,0 +1,10 @@
+[package]
+name = "mad"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+once_cell = "1.19.0"
+regex = "1.10.6"
+tokio = { version = "1.39.3", features = ["full"]}
+ureq = "2.10.1"
