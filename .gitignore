@@ -1,4 +1,6 @@
+Cargo.lock
 /target
 /downloads
-list.txt
+/libs
 /bin
+.vscode
